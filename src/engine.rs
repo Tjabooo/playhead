@@ -37,6 +37,8 @@ pub struct EngineConfig {
     pub upload: bool,
     /// Prefetch this many bytes at the file's head and tail when it's selected (players probe both).
     pub prefetch_bytes: u64,
+    /// Download cap in bytes/s for this engine (None = unlimited).
+    pub download_limit: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -54,6 +56,7 @@ impl Default for EngineConfig {
             resume: true,
             upload: true,
             prefetch_bytes: 2 * 1024 * 1024,
+            download_limit: None,
         }
     }
 }
@@ -172,7 +175,9 @@ impl Engine {
             completed_at: None,
             pending_external: None,
             external_bad: Default::default(),
+            limiter: None,
         };
+        actor.limiter = actor.cfg.download_limit.map(|l| Arc::new(peer::RateLimiter::new(l)));
         for p in peers {
             actor.add_known(p);
         }
@@ -233,7 +238,22 @@ impl Engine {
 
     /// Assist mode: where the other client keeps the selected file (tried in order).
     pub fn set_external_paths(&self, paths: Vec<PathBuf>) {
-        *self.shared.external_paths.lock().unwrap() = paths;
+        let changed = *self.shared.external_paths.lock().unwrap() != paths;
+        *self.shared.external_paths.lock().unwrap() = paths.clone();
+        // On Windows the first open and read of a file by a process can take up to a second
+        // (on-access scanning). Pay that now rather than on the first seek.
+        if changed && let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                use tokio::io::AsyncReadExt;
+                for p in paths {
+                    if let Ok(mut f) = tokio::fs::File::open(&p).await {
+                        let mut b = [0u8; 4096];
+                        let _ = f.read(&mut b).await;
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     pub fn external_paths(&self) -> Vec<PathBuf> {
@@ -377,6 +397,7 @@ struct Actor {
     completed_at: Option<Instant>,
     pending_external: Option<Vec<u8>>,
     external_bad: std::collections::HashSet<u32>,
+    limiter: Option<Arc<peer::RateLimiter>>,
 }
 
 const METADATA_PIECE: u64 = 16 * 1024;
@@ -570,6 +591,7 @@ impl Actor {
             metadata_size: self.meta.as_ref().map(|m| m.raw_info.len() as u64),
             guard: self.guard.clone(),
             events: self.events_tx.clone(),
+            limiter: self.limiter.clone(),
         };
         let guard = self.guard.clone();
         tokio::spawn(async move {

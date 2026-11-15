@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.1 (2026-11-15)
+
+- Assist mode opens the other client's file as soon as it's known: on Windows the first open by a new
+  process can take up to a second, which used to land on the first seek.
+- `download_limit` (bytes/s) per stream in `playhead serve`.
+
 ## v0.2.0 (2026-11-15)
 
 - `playhead serve`: daemon mode, many streams behind a token-protected loopback JSON API.

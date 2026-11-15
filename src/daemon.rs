@@ -313,6 +313,9 @@ async fn new_stream(cfg: &DaemonConfig, guard: &Arc<NetGuard>, streams: &Registr
             ecfg.extra_peers = peers;
             ecfg.resume = false;
             ecfg.picker.background = !assist;
+            if let Some(l) = v["download_limit"].as_u64().filter(|&l| l > 0) {
+                ecfg.download_limit = Some(l);
+            }
             if let Some(w) = v["window_mb"].as_u64() {
                 ecfg.picker.window_bytes = w.clamp(4, 512) * 1024 * 1024;
             }

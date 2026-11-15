@@ -41,6 +41,37 @@ pub struct PeerSetup {
     pub metadata_size: Option<u64>,
     pub guard: Arc<NetGuard>,
     pub events: mpsc::Sender<PeerEvent>,
+    /// Shared download cap (bytes/s) for all of this engine's peers.
+    pub limiter: Option<Arc<RateLimiter>>,
+}
+
+/// Token bucket shared by an engine's peer connections. Reading slower backs the peers off over TCP.
+pub struct RateLimiter {
+    rate: f64,
+    state: std::sync::Mutex<(f64, std::time::Instant)>,
+}
+
+impl RateLimiter {
+    pub fn new(bytes_per_sec: u64) -> Self {
+        RateLimiter { rate: bytes_per_sec.max(1) as f64, state: std::sync::Mutex::new((0.0, std::time::Instant::now())) }
+    }
+
+    pub async fn take(&self, n: usize) {
+        loop {
+            let wait = {
+                let mut s = self.state.lock().unwrap();
+                let now = std::time::Instant::now();
+                s.0 = (s.0 + now.duration_since(s.1).as_secs_f64() * self.rate).min(self.rate.max(n as f64));
+                s.1 = now;
+                if s.0 >= n as f64 {
+                    s.0 -= n as f64;
+                    return;
+                }
+                (n as f64 - s.0) / self.rate
+            };
+            tokio::time::sleep(Duration::from_secs_f64(wait.min(0.5))).await;
+        }
+    }
 }
 
 pub fn ext_handshake(metadata_size: Option<u64>, listen_port: Option<u16>) -> Message {
@@ -130,6 +161,7 @@ async fn session(
 
     let key = setup.key;
     let events = setup.events.clone();
+    let limiter = setup.limiter.clone();
     let reader = async move {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(180), wire::read_message(&mut rd))
@@ -161,7 +193,12 @@ async fn session(
                     }
                 }
                 Message::Extended { .. } | Message::KeepAlive | Message::Unknown(_) | Message::Port(_) => continue,
-                msg => PeerEvent::Msg { key, msg },
+                msg => {
+                    if let (Message::Piece { data, .. }, Some(l)) = (&msg, &limiter) {
+                        l.take(data.len()).await;
+                    }
+                    PeerEvent::Msg { key, msg }
+                }
             };
             if events.send(ev).await.is_err() {
                 return Ok::<String, std::io::Error>("engine gone".into());
@@ -200,5 +237,21 @@ async fn session(
     tokio::select! {
         r = reader => r,
         r = writer => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rate_limiter_paces_reads() {
+        let l = RateLimiter::new(200_000);
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            l.take(40_000).await;
+        }
+        let s = t.elapsed().as_secs_f64();
+        assert!((1.7..2.6).contains(&s), "400 kB at 200 kB/s took {s:.2} s");
     }
 }

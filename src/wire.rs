@@ -156,7 +156,7 @@ pub async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> io::Res
 }
 
 pub fn new_peer_id() -> [u8; 20] {
-    let mut id = *b"-PH0200-000000000000";
+    let mut id = *b"-PH0210-000000000000";
     for b in &mut id[8..] {
         *b = b"0123456789abcdefghijklmnopqrstuvwxyz"[rand::random_range(0..36)];
     }
@@ -194,6 +194,6 @@ mod tests {
         let h = read_handshake(&mut &hs[..]).await.unwrap();
         assert!(h.extensions);
         assert_eq!(h.info_hash, [3; 20]);
-        assert!(h.peer_id.starts_with(b"-PH0200-"));
+        assert!(h.peer_id.starts_with(b"-PH0210-"));
     }
 }
