@@ -5,8 +5,8 @@ use playhead::engine::{Engine, EngineConfig, Source};
 use playhead::magnet::Magnet;
 use playhead::metainfo::{Metainfo, build_torrent, hex};
 use playhead::net::{BindSpec, NetGuard, NetState};
-use playhead::testkit::{HttpTracker, SeedConfig, Seeder, UdpTracker, test_data};
-use std::net::{IpAddr, SocketAddr};
+use playhead::testkit::{HttpTracker, SeedConfig, Seeder, test_data};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -106,6 +106,8 @@ async fn magnet_metadata_and_range_streaming() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_socket_uses_the_bound_address() {
+    use playhead::testkit::UdpTracker;
+    use std::net::IpAddr;
     let (meta, data, files) = swarm(&[("film.mkv", 2_000_000)], 64 * 1024);
     let s1 = Seeder::start(LO.parse().unwrap(), meta.clone(), data.clone(), SeedConfig { serve_metadata: true, ..Default::default() })
         .await
