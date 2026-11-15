@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.3 (2026-11-15)
+
+- Peer exchange (BEP 11, receiving): peers tell playhead about other peers.
+- `start_lead_bytes` per stream: the start of the file is fetched before anyone reads it, far end
+  first, so next to a client downloading in order from the front the two meet in the middle.
+- New peers start with a 12-block pipeline (was 6): faster ramp-up over high-latency tunnels.
+
 ## v0.2.2 (2026-11-15)
 
 - `playhead serve --exit-with-stdin`: exits when its parent's pipe closes, so a daemon started by

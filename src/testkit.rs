@@ -28,6 +28,8 @@ pub struct SeedConfig {
     pub have: Option<Vec<u32>>,
     /// Answer ut_metadata requests.
     pub serve_metadata: bool,
+    /// Tell the downloader about these peers with ut_pex.
+    pub pex: Vec<SocketAddr>,
 }
 
 #[derive(Default)]
@@ -131,6 +133,17 @@ async fn seed_conn(
     if hs.extensions {
         let md = if cfg.serve_metadata { Some(meta.raw_info.len() as u64) } else { None };
         hello.extend(crate::peer::ext_handshake(md, None).encode());
+    }
+    if hs.extensions && !cfg.pex.is_empty() {
+        let mut added = Vec::new();
+        for p in &cfg.pex {
+            if let std::net::IpAddr::V4(ip) = p.ip() {
+                added.extend_from_slice(&ip.octets());
+                added.extend_from_slice(&p.port().to_be_bytes());
+            }
+        }
+        let payload = bencode::dict([("added", bencode::bytes(added))]).encode();
+        hello.extend(Message::Extended { id: crate::peer::OUR_UT_PEX, payload }.encode());
     }
     hello.extend(Message::Bitfield(bf.as_bytes().to_vec()).encode());
     hello.extend(Message::Unchoke.encode());

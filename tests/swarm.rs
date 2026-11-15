@@ -251,3 +251,27 @@ fn missing_interface_refuses_to_start() {
         assert!(NetGuard::start(BindSpec::Interface("playhead-test-nope0".into()), vec![]).is_err());
     });
 }
+
+/// Peer exchange: the only known peer tells us about another one, and we connect to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_found_through_pex_are_used() {
+    let (meta, data, files) = swarm(&[("film.mkv", 2_000_000)], 64 * 1024);
+    let hidden = Seeder::start(LO.parse().unwrap(), meta.clone(), data.clone(), SeedConfig::default()).await.unwrap();
+    let known = Seeder::start(
+        LO.parse().unwrap(),
+        meta.clone(),
+        data.clone(),
+        SeedConfig { pex: vec![hidden.addr], rate: Some(100_000), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let guard = NetGuard::manual(BindSpec::Unbound, "0.0.0.0".parse().unwrap());
+    let engine = Engine::start(Source::Torrent((*meta).clone()), cfg(dir.path(), vec![known.addr]), guard);
+    engine.select(0).await.unwrap();
+    wait_complete(&engine, 30).await;
+    assert!(hidden.stats.connections.load(Ordering::Relaxed) > 0, "never connected to the peer it learned through PEX");
+    assert!(hidden.stats.bytes_sent.load(Ordering::Relaxed) > 0);
+    assert_eq!(std::fs::read(dir.path().join("film.mkv")).unwrap(), files[0]);
+    engine.shutdown().await;
+}

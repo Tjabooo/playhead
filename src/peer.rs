@@ -16,6 +16,8 @@ pub type PeerKey = u64;
 
 /// Our extension message id for ut_metadata (what peers must use when sending to us).
 pub const OUR_UT_METADATA: u8 = 1;
+/// Our extension id for ut_pex (BEP 11): peers send us the addresses of their peers.
+pub const OUR_UT_PEX: u8 = 2;
 
 #[derive(Debug)]
 pub enum PeerEvent {
@@ -25,6 +27,7 @@ pub enum PeerEvent {
     MetadataPiece { key: PeerKey, piece: u32, data: Vec<u8> },
     MetadataReject { key: PeerKey, piece: u32 },
     MetadataRequest { key: PeerKey, piece: u32 },
+    Pex { key: PeerKey, peers: Vec<SocketAddr> },
     Closed { key: PeerKey, reason: String },
 }
 
@@ -76,7 +79,7 @@ impl RateLimiter {
 
 pub fn ext_handshake(metadata_size: Option<u64>, listen_port: Option<u16>) -> Message {
     let mut d = vec![
-        ("m", bencode::dict([("ut_metadata", bencode::int(OUR_UT_METADATA as i64))])),
+        ("m", bencode::dict([("ut_metadata", bencode::int(OUR_UT_METADATA as i64)), ("ut_pex", bencode::int(OUR_UT_PEX as i64))])),
         ("v", bencode::bytes(concat!("playhead ", env!("CARGO_PKG_VERSION")).as_bytes())),
         ("reqq", bencode::int(500)),
     ];
@@ -177,6 +180,20 @@ async fn session(
                         metadata_size: v.get("metadata_size").and_then(Value::as_int).filter(|&s| s > 0).map(|s| s as u64),
                         client: v.get("v").and_then(Value::as_str).map(str::to_string),
                     }
+                }
+                Message::Extended { id: OUR_UT_PEX, payload } => {
+                    let Ok(v) = bencode::decode(&payload) else { continue };
+                    let mut peers = Vec::new();
+                    if let Some(b) = v.get("added").and_then(Value::as_bytes) {
+                        peers.extend(crate::tracker::parse_compact_v4(b));
+                    }
+                    if let Some(b) = v.get("added6").and_then(Value::as_bytes) {
+                        peers.extend(crate::tracker::parse_compact_v6(b));
+                    }
+                    if peers.is_empty() {
+                        continue;
+                    }
+                    PeerEvent::Pex { key, peers }
                 }
                 Message::Extended { id: OUR_UT_METADATA, payload } => {
                     let Ok((v, used)) = bencode::decode_prefix(&payload) else { continue };

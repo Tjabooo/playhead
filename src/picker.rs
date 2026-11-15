@@ -134,6 +134,7 @@ pub struct Picker {
     inprog: HashMap<u32, InProgress>,
     readers: HashMap<u64, Reader>,
     prefetch: Vec<(u64, u64)>,
+    start_lead: Option<(u64, u64)>,
     /// Pieces another client is downloading right now: left to it unless they're critical.
     avoid: Bitfield,
     focus: (u64, u64),
@@ -156,6 +157,7 @@ impl Picker {
             inprog: HashMap::new(),
             readers: HashMap::new(),
             prefetch: Vec::new(),
+            start_lead: None,
             avoid: Bitfield::new(num_pieces),
             focus: (0, total_length),
             peers: HashMap::new(),
@@ -200,6 +202,12 @@ impl Picker {
 
     pub fn set_prefetch(&mut self, ranges: Vec<(u64, u64)>) {
         self.prefetch = ranges;
+    }
+
+    /// The start of the file a player needs before it begins, fetched from its far end backwards: next
+    /// to a client downloading in order from the front, the two meet in the middle instead of overlapping.
+    pub fn set_start_lead(&mut self, range: Option<(u64, u64)>) {
+        self.start_lead = range;
     }
 
     pub fn mark_have(&mut self, i: u32) {
@@ -388,6 +396,15 @@ impl Picker {
                 add(i, Class::Window, u64::MAX / 2, &self.have, &self.wanted);
             }
         }
+        if let Some((s, e)) = self.start_lead.filter(|(s, e)| e > s) {
+            let last = ((e - 1) / self.piece_length) as u32;
+            for i in (s / self.piece_length) as u32..=last {
+                if !self.avoid.get(i) {
+                    // Farther pieces rank first (smaller distance), right after the readers' own windows.
+                    add(i, Class::Window, u64::MAX / 4 + (last - i) as u64, &self.have, &self.wanted);
+                }
+            }
+        }
         out
     }
 
@@ -512,7 +529,7 @@ impl Picker {
         for key in keys {
             let p = &self.peers[&key];
             let slow = deadline && self.is_slow(p, best, now);
-            let depth = if deadline && p.snubbed { 1 } else { ((p.rate * 2.0) / BLOCK as f64).clamp(6.0, 250.0) as usize };
+            let depth = if deadline && p.snubbed { 1 } else { ((p.rate * 2.0) / BLOCK as f64).clamp(12.0, 250.0) as usize };
             let mut room = depth.saturating_sub(p.outstanding.len());
             if room == 0 {
                 continue;
@@ -829,6 +846,18 @@ mod tests {
         assert!(reqs.iter().all(|r| r.peer == 2));
         assert_eq!(p.duplicate_requests, 0);
         assert!(!reqs.iter().any(|r| r.index == 0 && r.begin == 0));
+    }
+
+    #[test]
+    fn start_lead_is_fetched_from_its_far_end() {
+        let t0 = Instant::now();
+        let mut p = picker(PickerMode::Deadline);
+        p.cfg.background = false;
+        p.set_start_lead(Some((0, 4 * PL)));
+        seeder(&mut p, 1, t0);
+        let reqs = p.pick(t0);
+        assert_eq!(reqs.first().map(|r| r.index), Some(3), "{reqs:?}");
+        assert!(reqs.iter().all(|r| r.index < 4), "nothing past the lead without background");
     }
 
     #[test]

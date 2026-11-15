@@ -313,6 +313,9 @@ async fn new_stream(cfg: &DaemonConfig, guard: &Arc<NetGuard>, streams: &Registr
             ecfg.extra_peers = peers;
             ecfg.resume = false;
             ecfg.picker.background = !assist;
+            if let Some(b) = v["start_lead_bytes"].as_u64() {
+                ecfg.start_lead_bytes = b.min(1 << 30);
+            }
             if let Some(l) = v["download_limit"].as_u64().filter(|&l| l > 0) {
                 ecfg.download_limit = Some(l);
             }

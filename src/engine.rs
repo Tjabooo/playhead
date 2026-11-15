@@ -39,6 +39,9 @@ pub struct EngineConfig {
     pub prefetch_bytes: u64,
     /// Download cap in bytes/s for this engine (None = unlimited).
     pub download_limit: Option<u64>,
+    /// Fetch this much of a selected file's start before anyone reads it, far end first (see
+    /// `Picker::set_start_lead`). 0 = off.
+    pub start_lead_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -57,6 +60,7 @@ impl Default for EngineConfig {
             upload: true,
             prefetch_bytes: 2 * 1024 * 1024,
             download_limit: None,
+            start_lead_bytes: 0,
         }
     }
 }
@@ -683,6 +687,19 @@ impl Actor {
                     p.md_rejects += 1;
                 }
             }
+            PeerEvent::Pex { key: _, peers } => {
+                let before = self.known.len();
+                for a in peers.into_iter().take(200) {
+                    if self.guard.bound() && a.is_ipv4() != matches!(self.guard.state(), NetState::Up { addr } if addr.is_ipv4()) {
+                        continue;
+                    }
+                    self.add_known(a);
+                }
+                if self.known.len() > before {
+                    log::debug(&format!("pex: {} new peers", self.known.len() - before));
+                    self.connect_more();
+                }
+            }
             PeerEvent::MetadataRequest { key, piece } => {
                 let Some(their) = self.peers.get(&key).and_then(|p| p.ut_metadata) else { return };
                 let msg = match &self.meta {
@@ -1068,6 +1085,9 @@ impl Actor {
         pk.set_wanted_range(lo, hi, (f.offset, f.offset + f.length));
         let pf = self.cfg.prefetch_bytes.min(f.length);
         pk.set_prefetch(vec![(f.offset, f.offset + pf), (f.offset + f.length - pf, f.offset + f.length)]);
+        if self.cfg.start_lead_bytes > 0 {
+            pk.set_start_lead(Some((f.offset, f.offset + self.cfg.start_lead_bytes.min(f.length))));
+        }
         if self.cfg.resume {
             let path = meta.file_path(&self.cfg.out_dir, file);
             if path.exists() {
