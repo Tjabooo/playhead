@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2 (2026-11-15)
+
+- `playhead serve --exit-with-stdin`: exits when its parent's pipe closes, so a daemon started by
+  another program never outlives it (Windows doesn't end child processes with their parent).
+
 ## v0.2.1 (2026-11-15)
 
 - Assist mode opens the other client's file as soon as it's known: on Windows the first open by a new

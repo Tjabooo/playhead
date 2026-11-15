@@ -172,6 +172,10 @@ enum Cmd {
         /// Close streams nobody asked about for this many minutes.
         #[arg(long, default_value_t = 10)]
         idle_mins: u64,
+        /// Exit when standard input closes: run as a child of the program that uses it, so it never
+        /// outlives that program (even when it's killed).
+        #[arg(long)]
+        exit_with_stdin: bool,
         #[arg(long, value_name = "EXT")]
         allow_ext: Vec<String>,
         #[arg(long, value_name = "EXT")]
@@ -337,7 +341,33 @@ async fn main() {
             let _ = tokio::signal::ctrl_c().await;
             e.shutdown().await;
         }
-        Cmd::Serve { net, api, token_file, cache_dir, listen_port, no_dht, max_peers, idle_mins, allow_ext, block_ext } => {
+        Cmd::Serve {
+            net,
+            api,
+            token_file,
+            cache_dir,
+            listen_port,
+            no_dht,
+            max_peers,
+            idle_mins,
+            allow_ext,
+            block_ext,
+            exit_with_stdin,
+        } => {
+            if exit_with_stdin {
+                tokio::spawn(async {
+                    use tokio::io::AsyncReadExt;
+                    let mut stdin = tokio::io::stdin();
+                    let mut buf = [0u8; 256];
+                    while let Ok(n) = stdin.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    log::info("standard input closed (parent gone): exiting");
+                    std::process::exit(0);
+                });
+            }
             let token = match token_file {
                 Some(p) => std::fs::read_to_string(&p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display()))).trim().to_string(),
                 None => std::env::var("PLAYHEAD_TOKEN").unwrap_or_default(),

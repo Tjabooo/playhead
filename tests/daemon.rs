@@ -169,3 +169,32 @@ async fn assist_mode_fetches_only_what_is_read() {
     // 1 MB read + 4 MB window + 2 MB head/tail prefetch + piece slack, far below the 16 MB file.
     assert!(sent < 9_000_000, "assist mode downloaded {sent} bytes");
 }
+
+#[test]
+fn serve_exits_when_stdin_closes() {
+    use std::io::Write;
+    let bin = env!("CARGO_BIN_EXE_playhead");
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(bin)
+        .args(["serve", "--unbound", "--api", "127.0.0.1:0", "--cache-dir"])
+        .arg(dir.path())
+        .arg("--exit-with-stdin")
+        .env("PLAYHEAD_TOKEN", TOKEN)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "should keep running while stdin is open");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"\n").unwrap();
+    drop(stdin);
+    for _ in 0..50 {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    panic!("didn't exit after stdin closed");
+}
