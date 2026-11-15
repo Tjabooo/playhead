@@ -140,33 +140,33 @@ its address disappears and the guard trips.
 
 ## Benchmark
 
-`playhead bench` builds a local swarm and plays a stream through the HTTP server with a simulated
-player: a fixed bitrate, 2 s start buffer and 30 s read-ahead. It plays 60 s, seeks to 60 % and
-plays 25 s more. The swarm has four fast seeders sharing 1.5 MB/s, one slow seeder at 12 kB/s and
-one *stuck* seeder that unchokes you and then never answers. The video is 0.78 MB/s and 1 GiB,
-in 1 MiB pieces.
+`playhead bench` builds a local swarm and plays a 1 GiB, 0.78 MB/s video through it with a
+simulated player: 2 s start buffer, 30 s read-ahead, 60 s of playback, a seek to 60 % and 25 s more.
+`--suite` runs five swarms: four fast seeders sharing 1.5 MB/s (*healthy*), plus a 12 kB/s
+seeder (*slow-peer*), plus a seeder that unchokes and never answers (*stuck-peer*), six seeders
+that each have about 60 % of the pieces (*patchy*), and four uncapped seeders (*fast*).
 
-The same swarm runs once with the naive sequential picker (in order, no peer ranking, 60 s request
-timeout, which is what a "download in sequential order" client does) and once with the deadline picker.
+`--client qbittorrent` runs the same swarm against a real qBittorrent (5.3.0, libtorrent 2.1.2
+here). It's driven the way a media server's "play while downloading" does: sequential download
+and first/last piece priority, with reads held until `pieceStates` says the piece is verified.
+`bench/qbittorrent-test.sh` starts a throwaway headless one.
 
-Two runs each on the same swarm, identical within 0.05 s:
+Median of two runs each (`playhead bench --suite --runs 2 --client qbittorrent --client playhead`):
 
-| | naive sequential | deadline (playhead) |
-| --- | --- | --- |
-| Start (2 s buffered) | 182 s | **2.6 s** |
-| Stalls while playing | 1, 102 s | **0** |
-| Seek to 60 %: first byte | 2.6 s | **2.0 s** |
-| Seek to 60 %: playing again | 9.4 s | **2.1 s** |
-| Duplicate block requests | 0 | 25 (about 0.4 MB) |
+| Swarm | Start: qBittorrent → playhead | Stalls while playing | Seek to 60 %, playing again |
+| --- | --- | --- | --- |
+| healthy | 28 s → **1.4 s** | 3 (9 s) → **0** | 367 s → **2.0 s** |
+| slow-peer | 27 s → **2.6 s** | 5 (126 s, longest 68 s) → **0** | 300 s → **2.0 s** |
+| stuck-peer | 68 s → **2.6 s** | 2 (6 s) → **0** | 320 s → **2.0 s** |
+| patchy | 27 s → **2.5 s** | 4 (15 s) → **0** | 357 s → **2.0 s** |
+| fast | 8 s → **0.1 s** | 0 → 0 | 3 s → **0 s** (whole file: 130 s → 85 s) |
 
-The sequential picker waits out its 60 s request timeout every time the stuck peer holds the
-next block. The deadline picker re-requests those blocks from a fast peer within about 1.5 s.
+qBittorrent's seek waits for the sequential download to get there. playhead moves its window and
+has the new spot in about two seconds.
 
 Real swarm, a Debian netinst ISO (756 MiB) through a Mullvad WireGuard interface: the whole file
 in 71 s with a matching SHA256, cold seeks returning 4 MiB in 2.7–3.8 s, and 0.6 % of the data
 fetched twice.
-
-Run it yourself: `playhead bench --runs 2` (see `playhead bench --help`).
 
 ## How it works
 
