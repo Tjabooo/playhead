@@ -73,7 +73,42 @@ PASS public IP through the tunnel 185.65.134.1, without it 203.0.113.7
 PASS kill switch: no TCP, UDP or DNS while the tunnel is down
 ```
 
-### HTTP API
+### Daemon mode (for media servers)
+
+`playhead serve` runs one process for many streams behind a token-protected JSON API on a
+loopback address. A media server starts it once and asks it for streams:
+
+```sh
+PLAYHEAD_TOKEN=$(openssl rand -hex 24) playhead serve --bind-address 10.64.12.34 \
+  --api 127.0.0.1:9700 --cache-dir /var/cache/playhead
+```
+
+| Route | What |
+| --- | --- |
+| `GET /api/health` | Version, network guard state, stream count |
+| `POST /api/streams` | Start (or reuse) a stream: `{"torrent": "<base64 .torrent>" \| "magnet": … \| "info_hash": …, "file": 0, "trackers": [], "peers": [], "assist": true, "external_paths": [], "states": "0122…"}` |
+| `GET /api/streams[/<id>]` | Status, plus `"own"`: the pieces this stream downloaded itself |
+| `PUT /api/streams/<id>/external` | The other client's piece states and file paths (assist mode) |
+| `PUT /api/streams/<id>/peers` | More peers |
+| `DELETE /api/streams/<id>` | Stop and delete its cache |
+| `GET /s/<id>/file/<n>` | The stream (range requests) |
+
+Every request needs `Authorization: Bearer <token>`. Streams nobody asks about for 10 minutes
+are closed.
+
+**Assist mode** (`"assist": true`) is for running next to another client that already downloads
+the torrent in order, like qBittorrent, without taking it over:
+- Send playhead that client's piece states (qBittorrent's `pieceStates`: 0 missing, 1 downloading,
+  2 verified) and where it keeps the file.
+- Pieces the other client has are read from its file. Each one is hash-checked once, and a bad
+  one is downloaded after all.
+- Pieces it's busy with are left to it unless a reader needs them right now.
+- playhead downloads only what a reader needs next that the other client doesn't have yet: the
+  start, a seek target, a piece stuck on a slow peer.
+- Nothing is downloaded in the background, and the other client stays the one that finishes,
+  seeds and keeps the file.
+
+### HTTP API (single stream)
 
 | Route | What |
 | --- | --- |
@@ -154,8 +189,7 @@ Run it yourself: `playhead bench --runs 2` (see `playhead bench --help`).
   test: bound to `127.0.0.2`, every connection that reaches the seeders and both trackers must
   come from that address.
 
-Not yet: uTP, PEX, HTTPS trackers, IPv6 peers when bound to an IPv4 tunnel, BitTorrent v2, and
-running several torrents behind one API.
+Not yet: uTP, PEX, HTTPS trackers, IPv6 peers when bound to an IPv4 tunnel, and BitTorrent v2.
 
 ## License
 

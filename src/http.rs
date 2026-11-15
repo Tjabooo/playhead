@@ -7,7 +7,10 @@
 use crate::engine::Engine;
 use crate::magnet::percent_encode;
 use serde_json::json;
+use sha1::{Digest, Sha1};
+use std::collections::HashSet;
 use std::io::SeekFrom;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -70,16 +73,19 @@ pub fn parse_range(h: Option<&str>, len: u64) -> Result<Option<(u64, u64)>, ()> 
     Ok(Some((s, e)))
 }
 
-struct Request {
-    method: String,
-    path: String,
-    range: Option<String>,
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub range: Option<String>,
+    pub authorization: Option<String>,
+    pub body: Vec<u8>,
 }
 
-async fn read_request(s: &mut TcpStream) -> std::io::Result<Option<Request>> {
+/// Read one request (headers + a body of up to 64 MiB when Content-Length says so).
+pub async fn read_request(s: &mut TcpStream) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 1024];
-    loop {
+    let mut tmp = [0u8; 8192];
+    let head_end = loop {
         let n = tokio::time::timeout(Duration::from_secs(15), s.read(&mut tmp))
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "request timeout"))??;
@@ -87,30 +93,48 @@ async fn read_request(s: &mut TcpStream) -> std::io::Result<Option<Request>> {
             return Ok(None);
         }
         buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(e) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break e;
         }
-        if buf.len() > 16 * 1024 {
+        if buf.len() > 32 * 1024 {
             return Ok(None);
         }
-    }
-    let text = String::from_utf8_lossy(&buf);
+    };
+    let text = String::from_utf8_lossy(&buf[..head_end]).to_string();
     let mut lines = text.split("\r\n");
     let mut first = lines.next().unwrap_or("").split_whitespace();
     let method = first.next().unwrap_or("").to_string();
     let path = first.next().unwrap_or("/").to_string();
-    let mut range = None;
+    let (mut range, mut authorization, mut length) = (None, None, 0usize);
     for l in lines {
-        if let Some((k, v)) = l.split_once(':')
-            && k.trim().eq_ignore_ascii_case("range")
-        {
-            range = Some(v.trim().to_string());
+        let Some((k, v)) = l.split_once(':') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        if k.eq_ignore_ascii_case("range") {
+            range = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("authorization") {
+            authorization = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("content-length") {
+            length = v.parse().unwrap_or(0);
         }
     }
-    Ok(Some(Request { method, path, range }))
+    if length > 64 * 1024 * 1024 {
+        return Ok(None);
+    }
+    let mut body = buf[head_end + 4..].to_vec();
+    while body.len() < length {
+        let n = tokio::time::timeout(Duration::from_secs(15), s.read(&mut tmp))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "body timeout"))??;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    body.truncate(length);
+    Ok(Some(Request { method, path, range, authorization, body }))
 }
 
-async fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
+pub async fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
@@ -133,7 +157,8 @@ pub async fn serve(engine: Engine, listener: TcpListener) {
     }
 }
 
-async fn handle(engine: &Engine, s: &mut TcpStream, req: Request) -> std::io::Result<()> {
+/// Serve one request against one engine (`req.path` relative to the engine: `/`, `/status`, `/file/<n>`, `/stream`).
+pub async fn handle(engine: &Engine, s: &mut TcpStream, req: Request) -> std::io::Result<()> {
     if req.method != "GET" && req.method != "HEAD" {
         return respond(s, "405 Method Not Allowed", "text/plain", b"GET or HEAD only\n").await;
     }
@@ -174,6 +199,72 @@ async fn handle(engine: &Engine, s: &mut TcpStream, req: Request) -> std::io::Re
         },
         _ => respond(s, "404 Not Found", "text/plain", b"not found\n").await,
     }
+}
+
+/// Open the other client's file (first of its known paths that opens).
+async fn open_external(engine: &Engine, ext: &mut Option<(PathBuf, tokio::fs::File)>) -> bool {
+    let paths = engine.external_paths();
+    if let Some((p, _)) = ext
+        && paths.first() == Some(p)
+    {
+        return true;
+    }
+    for p in paths {
+        if let Ok(f) = tokio::fs::File::open(&p).await {
+            *ext = Some((p, f));
+            return true;
+        }
+    }
+    false
+}
+
+/// Read `buf.len()` bytes at file offset `pos` from the other client's file. False = not readable yet.
+async fn read_external(engine: &Engine, ext: &mut Option<(PathBuf, tokio::fs::File)>, pos: u64, buf: &mut [u8]) -> bool {
+    if !open_external(engine, ext).await {
+        return false;
+    }
+    let (_, fh) = ext.as_mut().unwrap();
+    if fh.seek(SeekFrom::Start(pos)).await.is_err() {
+        *ext = None;
+        return false;
+    }
+    match fh.read_exact(buf).await {
+        Ok(_) => true,
+        Err(_) => {
+            *ext = None; // moved (e.g. finished and moved to its final folder): reopen next time
+            false
+        }
+    }
+}
+
+/// Hash-check a piece in the other client's file. None = can't tell yet (not readable, or the piece
+/// also covers a neighbouring file, which we can't read: then it's trusted).
+async fn check_external(
+    engine: &Engine,
+    meta: &crate::metainfo::Metainfo,
+    file: usize,
+    piece: u32,
+    ext: &mut Option<(PathBuf, tokio::fs::File)>,
+) -> Option<bool> {
+    let f = &meta.files[file];
+    let ps = piece as u64 * meta.piece_length;
+    let pe = ps + meta.piece_size(piece);
+    if ps < f.offset || pe > f.offset + f.length {
+        return Some(true);
+    }
+    let mut data = vec![0u8; (pe - ps) as usize];
+    // A freshly verified piece can take a moment to reach the file: retry for up to 10 s.
+    for _ in 0..40 {
+        if read_external(engine, ext, ps - f.offset, &mut data).await {
+            if Sha1::digest(&data).as_slice() == meta.pieces[piece as usize] {
+                return Some(true);
+            }
+        } else if engine.external_paths().is_empty() {
+            return Some(false);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if engine.external_paths().is_empty() { None } else { Some(false) }
 }
 
 struct ReaderGuard<'a> {
@@ -230,7 +321,9 @@ async fn stream_file(engine: &Engine, s: &mut TcpStream, req: &Request, index: u
     s.write_all(head.as_bytes()).await?;
 
     let path = engine.file_path(&meta, index);
-    let mut file: Option<tokio::fs::File> = None;
+    let mut own: Option<tokio::fs::File> = None;
+    let mut ext: Option<(PathBuf, tokio::fs::File)> = None;
+    let mut ext_checked: HashSet<u32> = HashSet::new();
     let (mut rd, mut wr) = s.split();
     let mut pos = start;
     let mut last_piece = u32::MAX;
@@ -244,9 +337,9 @@ async fn stream_file(engine: &Engine, s: &mut TcpStream, req: &Request, index: u
             last_piece = piece;
         }
         if !engine.has_piece(piece) {
-            // Wait for the piece, but stop as soon as the client goes away.
+            // Wait for the piece, but stop as soon as the client goes away or the engine stops.
             tokio::select! {
-                _ = engine.wait_piece(piece) => {}
+                alive = engine.wait_piece(piece) => if !alive { return Ok(()); },
                 r = rd.read(&mut sink) => {
                     if matches!(r, Ok(0) | Err(_)) { return Ok(()); }
                 }
@@ -255,12 +348,36 @@ async fn stream_file(engine: &Engine, s: &mut TcpStream, req: &Request, index: u
         }
         let piece_end = ((piece as u64 + 1) * meta.piece_length).min(f.offset + f.length) - f.offset; // exclusive, file-relative
         let n = (piece_end - pos).min(end + 1 - pos).min(CHUNK) as usize;
-        if file.is_none() {
-            file = Some(tokio::fs::File::open(&path).await?);
+        if engine.has_own(piece) {
+            if own.is_none() {
+                own = Some(tokio::fs::File::open(&path).await?);
+            }
+            let fh = own.as_mut().unwrap();
+            fh.seek(SeekFrom::Start(pos)).await?;
+            fh.read_exact(&mut buf[..n]).await?;
+        } else {
+            // Assist mode: the other client has it. Check it once against the piece hash (it can be
+            // a moment between "verified" and the bytes being readable), then read from its file.
+            if !ext_checked.contains(&piece) {
+                match check_external(engine, &meta, index, piece, &mut ext).await {
+                    Some(true) => {
+                        ext_checked.insert(piece);
+                    }
+                    Some(false) => {
+                        engine.external_bad(piece);
+                        continue;
+                    }
+                    None => {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                }
+            }
+            if !read_external(engine, &mut ext, pos, &mut buf[..n]).await {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
         }
-        let fh = file.as_mut().unwrap();
-        fh.seek(SeekFrom::Start(pos)).await?;
-        fh.read_exact(&mut buf[..n]).await?;
         wr.write_all(&buf[..n]).await?;
         pos += n as u64;
     }

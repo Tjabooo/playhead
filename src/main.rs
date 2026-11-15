@@ -149,6 +149,34 @@ enum Cmd {
         #[command(flatten)]
         engine: EngineArgs,
     },
+    /// Run as a daemon for another program: many streams behind a token-protected loopback API.
+    Serve {
+        #[command(flatten)]
+        net: NetArgs,
+        /// API and stream address (loopback only).
+        #[arg(long, default_value = "127.0.0.1:9700")]
+        api: SocketAddr,
+        /// File holding the API token (else the PLAYHEAD_TOKEN environment variable).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Where streams keep the pieces they download themselves.
+        #[arg(long)]
+        cache_dir: PathBuf,
+        /// Incoming peer port (0 = outgoing connections only).
+        #[arg(long, default_value_t = 0)]
+        listen_port: u16,
+        #[arg(long)]
+        no_dht: bool,
+        #[arg(long, default_value_t = 40)]
+        max_peers: usize,
+        /// Close streams nobody asked about for this many minutes.
+        #[arg(long, default_value_t = 10)]
+        idle_mins: u64,
+        #[arg(long, value_name = "EXT")]
+        allow_ext: Vec<String>,
+        #[arg(long, value_name = "EXT")]
+        block_ext: Vec<String>,
+    },
     /// Fetch the metadata and list the files.
     Files {
         source: String,
@@ -186,7 +214,7 @@ enum Cmd {
         #[arg(long)]
         rate_kb: Option<u64>,
     },
-    /// Streaming benchmark on a local swarm: deadline picker vs a naive sequential picker.
+    /// Streaming benchmark on a local swarm: playhead vs a naive sequential picker or a real qBittorrent.
     Bench {
         #[arg(long, default_value_t = 1024)]
         size_mb: u64,
@@ -195,21 +223,34 @@ enum Cmd {
         /// Video bitrate in kB/s.
         #[arg(long, default_value_t = 780)]
         bitrate_kb: u64,
-        /// Total upload of the fast seeders in kB/s.
+        /// Total upload of the fast seeders in kB/s (0 = unlimited).
         #[arg(long, default_value_t = 1500)]
         swarm_kb: u64,
         #[arg(long, default_value_t = 4)]
         fast_peers: usize,
-        /// The stuck seeder answers requests only after this many seconds (default: never, within a run).
+        #[arg(long, default_value_t = 1)]
+        slow_peers: usize,
+        #[arg(long, default_value_t = 1)]
+        stuck_peers: usize,
+        /// The stuck seeders answer requests only after this many seconds (default: never, within a run).
         #[arg(long, default_value_t = 1000)]
         stuck_s: u64,
         #[arg(long, default_value_t = 60)]
         play_s: u64,
         #[arg(long, default_value_t = 1)]
         runs: usize,
-        /// Only run one picker.
-        #[arg(long, value_parser = ["deadline", "sequential"])]
-        only: Option<String>,
+        /// Clients to compare (repeatable): playhead, naive (sequential picker), qbittorrent.
+        #[arg(long, value_parser = ["playhead", "naive", "qbittorrent"])]
+        client: Vec<String>,
+        /// qBittorrent WebUI address (no auth from localhost; see bench/qbittorrent-test.sh).
+        #[arg(long, default_value = "127.0.0.1:8099")]
+        qbit_api: SocketAddr,
+        /// Run every scenario (healthy, slow-peer, stuck-peer, patchy, fast) instead of one custom swarm.
+        #[arg(long)]
+        suite: bool,
+        /// Append each result as a JSON line to this file.
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -296,6 +337,25 @@ async fn main() {
             let _ = tokio::signal::ctrl_c().await;
             e.shutdown().await;
         }
+        Cmd::Serve { net, api, token_file, cache_dir, listen_port, no_dht, max_peers, idle_mins, allow_ext, block_ext } => {
+            let token = match token_file {
+                Some(p) => std::fs::read_to_string(&p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display()))).trim().to_string(),
+                None => std::env::var("PLAYHEAD_TOKEN").unwrap_or_default(),
+            };
+            let guard = net.guard();
+            let engine = EngineConfig {
+                listen: listen_port != 0,
+                listen_port,
+                dht: !no_dht,
+                max_peers,
+                filter: FileFilter::new(&allow_ext, &block_ext),
+                ..EngineConfig::default()
+            };
+            let cfg = playhead::daemon::DaemonConfig { api, token, cache_dir, engine, idle: Duration::from_secs(idle_mins * 60) };
+            if let Err(e) = playhead::daemon::run(cfg, guard).await {
+                die(&e.to_string());
+            }
+        }
         Cmd::Files { source, net, engine } => {
             let guard = net.guard();
             let cfg = engine.config();
@@ -331,7 +391,23 @@ async fn main() {
             println!("magnet:?xt=urn:btih:{}&x.pe={}", hex(&meta.info_hash), s.addr);
             let _ = tokio::signal::ctrl_c().await;
         }
-        Cmd::Bench { size_mb, piece_kb, bitrate_kb, swarm_kb, fast_peers, stuck_s, play_s, runs, only, json } => {
+        Cmd::Bench {
+            size_mb,
+            piece_kb,
+            bitrate_kb,
+            swarm_kb,
+            fast_peers,
+            slow_peers,
+            stuck_peers,
+            stuck_s,
+            play_s,
+            runs,
+            client,
+            qbit_api,
+            suite,
+            out,
+            json,
+        } => {
             log::set_level(1);
             let cfg = bench::BenchConfig {
                 size: size_mb * 1024 * 1024,
@@ -339,36 +415,55 @@ async fn main() {
                 bitrate: bitrate_kb as f64 * 1000.0,
                 swarm_rate: swarm_kb * 1000,
                 fast_peers,
+                slow_peers,
+                stuck_peers,
                 stuck_for: Duration::from_secs(stuck_s),
                 play_for: Duration::from_secs(play_s),
                 ..bench::BenchConfig::default()
             };
             let (meta, data) = bench::make_swarm(&cfg);
-            let modes: Vec<PickerMode> = match only.as_deref() {
-                Some("deadline") => vec![PickerMode::Deadline],
-                Some("sequential") => vec![PickerMode::Sequential],
-                _ => vec![PickerMode::Sequential, PickerMode::Deadline],
-            };
+            let names = if client.is_empty() { vec!["naive".to_string(), "playhead".to_string()] } else { client };
+            let clients: Vec<bench::Client> = names
+                .iter()
+                .map(|c| match c.as_str() {
+                    "naive" => bench::Client::Playhead(PickerMode::Sequential),
+                    "qbittorrent" => bench::Client::Qbittorrent { api: qbit_api },
+                    _ => bench::Client::Playhead(PickerMode::Deadline),
+                })
+                .collect();
+            let scenarios = if suite { bench::suite(&cfg) } else { vec![("custom", cfg.clone())] };
             let mut results = Vec::new();
-            for run in 0..runs {
-                for &m in &modes {
-                    eprintln!("run {}/{runs}: {m:?} ...", run + 1);
-                    let r = bench::run_one(&cfg, m, meta.clone(), data.clone()).await;
-                    if !json {
-                        println!(
-                            "{:<10} startup {:>6.2}s  stalls {:>2} ({:>6.2}s, longest {:>6.2}s)  seek: first byte {:>6.2}s, playing {:>6.2}s  dup {:>4}  wasted {:.1} MB",
-                            r["picker"].as_str().unwrap(),
-                            r["startup_s"].as_f64().unwrap(),
-                            r["stalls"],
-                            r["stall_s"].as_f64().unwrap(),
-                            r["longest_stall_s"].as_f64().unwrap(),
-                            r["seek_first_byte_s"].as_f64().unwrap(),
-                            r["seek_startup_s"].as_f64().unwrap(),
-                            r["duplicate_requests"],
-                            r["wasted_mb"].as_f64().unwrap(),
-                        );
+            for (name, sc) in &scenarios {
+                for run in 0..runs {
+                    for c in &clients {
+                        eprintln!("{name} run {}/{runs}: {} ...", run + 1, c.name());
+                        let mut r = bench::run_one(sc, c, meta.clone(), data.clone()).await;
+                        r["scenario"] = serde_json::json!(name);
+                        r["run"] = serde_json::json!(run + 1);
+                        if let Some(path) = &out {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                let _ = writeln!(f, "{r}");
+                            }
+                        }
+                        if !json {
+                            let f = |k: &str| r[k].as_f64().unwrap_or(f64::NAN);
+                            println!(
+                                "{:<10} {:<11} start {:>7.2}s  stalls {:>2} ({:>6.2}s, longest {:>6.2}s)  seek: first byte {:>6.2}s, playing {:>6.2}s{}{}",
+                                name,
+                                r["client"].as_str().unwrap_or("?"),
+                                f("startup_s"),
+                                r["stalls"],
+                                f("stall_s"),
+                                f("longest_stall_s"),
+                                f("seek_first_byte_s"),
+                                f("seek_startup_s"),
+                                r["complete_s"].as_f64().map(|c| format!("  complete {c:.1}s")).unwrap_or_default(),
+                                if r["gave_up"] == true { "  GAVE UP" } else { "" },
+                            );
+                        }
+                        results.push(r);
                     }
-                    results.push(r);
                 }
             }
             if json {

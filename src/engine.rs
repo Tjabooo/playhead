@@ -73,11 +73,17 @@ enum Ctrl {
     TrackerDone { idx: usize, result: Result<tracker::AnnounceResult, String> },
     DhtDone { result: Result<Vec<SocketAddr>, String> },
     Incoming { stream: tokio::net::TcpStream, addr: SocketAddr, hs: wire::Handshake },
+    External { states: Vec<u8> },
+    ExternalBad { index: u32 },
     Shutdown { reply: oneshot::Sender<()> },
 }
 
 struct Shared {
+    /// Pieces this engine downloaded and verified (in its own files).
     have: Mutex<Bitfield>,
+    /// Assist mode: pieces another client already has, read from `external_paths`.
+    external: Mutex<Bitfield>,
+    external_paths: Mutex<Vec<PathBuf>>,
 }
 
 /// Handle used by the HTTP server and the CLI.
@@ -99,7 +105,11 @@ impl Engine {
         let (events_tx, events_rx) = mpsc::channel(4096);
         let (meta_tx, meta_rx) = watch::channel(None);
         let (have_tx, have_rx) = watch::channel(0u64);
-        let shared = Arc::new(Shared { have: Mutex::new(Bitfield::new(0)) });
+        let shared = Arc::new(Shared {
+            have: Mutex::new(Bitfield::new(0)),
+            external: Mutex::new(Bitfield::new(0)),
+            external_paths: Mutex::new(Vec::new()),
+        });
         let (info_hash, meta, mut trackers, mut peers) = match source {
             Source::Magnet(m) => (m.info_hash, None, m.trackers, m.peers),
             Source::Torrent(t) => {
@@ -160,6 +170,8 @@ impl Engine {
             last_choke: Instant::now(),
             optimistic: None,
             completed_at: None,
+            pending_external: None,
+            external_bad: Default::default(),
         };
         for p in peers {
             actor.add_known(p);
@@ -200,18 +212,56 @@ impl Engine {
     }
 
     pub fn has_piece(&self, i: u32) -> bool {
+        self.has_own(i) || self.has_external(i)
+    }
+
+    /// Downloaded and verified by this engine.
+    pub fn has_own(&self, i: u32) -> bool {
         self.shared.have.lock().unwrap().get(i)
     }
 
-    /// Wait until piece `i` is verified and on disk.
-    pub async fn wait_piece(&self, i: u32) {
+    /// Available from the other client's file (assist mode).
+    pub fn has_external(&self, i: u32) -> bool {
+        self.shared.external.lock().unwrap().get(i)
+    }
+
+    /// Own pieces as a digit string, `2` = have, `0` = not (same codes as qBittorrent's pieceStates).
+    pub fn own_states(&self) -> String {
+        let b = self.shared.have.lock().unwrap();
+        (0..b.len()).map(|i| if b.get(i) { '2' } else { '0' }).collect()
+    }
+
+    /// Assist mode: where the other client keeps the selected file (tried in order).
+    pub fn set_external_paths(&self, paths: Vec<PathBuf>) {
+        *self.shared.external_paths.lock().unwrap() = paths;
+    }
+
+    pub fn external_paths(&self) -> Vec<PathBuf> {
+        self.shared.external_paths.lock().unwrap().clone()
+    }
+
+    /// Assist mode: the other client's piece states (0 = missing, 1 = downloading, 2 = verified).
+    /// Verified pieces are read from its file instead of being downloaded; ones it's downloading
+    /// are left to it unless a reader needs them next.
+    pub fn set_external_states(&self, states: Vec<u8>) {
+        let _ = self.ctrl.send(Ctrl::External { states });
+    }
+
+    /// A piece read from the other client's file failed its hash check: download it after all.
+    pub fn external_bad(&self, i: u32) {
+        self.shared.external.lock().unwrap().clear(i);
+        let _ = self.ctrl.send(Ctrl::ExternalBad { index: i });
+    }
+
+    /// Wait until piece `i` can be read. False if the engine stopped first.
+    pub async fn wait_piece(&self, i: u32) -> bool {
         let mut rx = self.have_ver.clone();
         loop {
             if self.has_piece(i) {
-                return;
+                return true;
             }
             if rx.changed().await.is_err() {
-                std::future::pending::<()>().await;
+                return false;
             }
         }
     }
@@ -325,6 +375,8 @@ struct Actor {
     last_choke: Instant,
     optimistic: Option<PeerKey>,
     completed_at: Option<Instant>,
+    pending_external: Option<Vec<u8>>,
+    external_bad: std::collections::HashSet<u32>,
 }
 
 const METADATA_PIECE: u64 = 16 * 1024;
@@ -741,7 +793,11 @@ impl Actor {
             self.send(k, Message::Have(index));
             self.update_interest(k);
         }
-        if self.completed_at.is_none() && self.picker.as_ref().unwrap().wanted_remaining() == 0 && !self.selected.is_empty() {
+        self.check_complete();
+    }
+
+    fn check_complete(&mut self) {
+        if self.completed_at.is_none() && self.picker.as_ref().is_some_and(|p| p.wanted_remaining() == 0) && !self.selected.is_empty() {
             self.completed_at = Some(Instant::now());
             log::info(&format!("selected file(s) complete in {:.1} s", self.started.elapsed().as_secs_f64()));
             if let Some(s) = &mut self.storage {
@@ -812,6 +868,7 @@ impl Actor {
         let mut pk = Picker::new(self.cfg.picker.clone(), meta.piece_length, meta.total_length);
         pk.set_wanted_range(1, 0, (0, meta.total_length)); // nothing until a file is selected
         *self.shared.have.lock().unwrap() = Bitfield::new(meta.num_pieces());
+        *self.shared.external.lock().unwrap() = Bitfield::new(meta.num_pieces());
         self.storage = Some(Storage::new(self.cfg.out_dir.clone(), meta.clone()));
         let now = Instant::now();
         let keys: Vec<PeerKey> = self.peers.iter().filter(|(_, p)| p.ready).map(|(k, _)| *k).collect();
@@ -831,6 +888,9 @@ impl Actor {
         self.picker = Some(pk);
         self.meta = Some(meta.clone());
         self.meta_tx.send_replace(Some(meta));
+        if let Some(states) = self.pending_external.take() {
+            self.on_external(states);
+        }
     }
 
     // ---- control ----
@@ -914,7 +974,48 @@ impl Actor {
                 }
                 self.spawn_peer(addr, Some((stream, hs)));
             }
+            Ctrl::External { states } => self.on_external(states),
+            Ctrl::ExternalBad { index } => {
+                self.external_bad.insert(index);
+                if let Some(pk) = &mut self.picker
+                    && !self.shared.have.lock().unwrap().get(index)
+                {
+                    log::warn(&format!("piece {index} from the other client's file failed its hash check: downloading it"));
+                    pk.unmark_have(index);
+                    self.completed_at = None;
+                }
+            }
             Ctrl::Shutdown { .. } => unreachable!(),
+        }
+    }
+
+    fn on_external(&mut self, states: Vec<u8>) {
+        let Some(pk) = &mut self.picker else {
+            self.pending_external = Some(states);
+            return;
+        };
+        let n = pk.num_pieces() as usize;
+        let mut cancels = Vec::new();
+        let mut newly = 0;
+        {
+            let own = self.shared.have.lock().unwrap();
+            let mut ext = self.shared.external.lock().unwrap();
+            for (i, &s) in states.iter().enumerate().take(n) {
+                let i = i as u32;
+                if s == 2 && !own.get(i) && !ext.get(i) && !self.external_bad.contains(&i) {
+                    ext.set(i);
+                    cancels.extend(pk.mark_have_elsewhere(i));
+                    newly += 1;
+                }
+                pk.set_avoid(i, s == 1);
+            }
+        }
+        for c in cancels {
+            self.send(c.peer, Message::Cancel { index: c.index, begin: c.begin, length: c.length });
+        }
+        if newly > 0 {
+            self.have_tx.send_modify(|v| *v += 1);
+            self.check_complete();
         }
     }
 

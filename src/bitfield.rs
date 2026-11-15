@@ -50,6 +50,13 @@ impl Bitfield {
         }
     }
 
+    pub fn clear(&mut self, i: u32) {
+        if i < self.len && self.raw_get(i) {
+            self.bits[(i / 8) as usize] &= !(0x80 >> (i % 8));
+            self.count -= 1;
+        }
+    }
+
     pub fn len(&self) -> u32 {
         self.len
     }

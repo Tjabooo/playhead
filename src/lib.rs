@@ -3,6 +3,7 @@
 pub mod bench;
 pub mod bencode;
 pub mod bitfield;
+pub mod daemon;
 pub mod dht;
 pub mod dns;
 pub mod engine;

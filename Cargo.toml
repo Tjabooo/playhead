@@ -1,6 +1,6 @@
 [package]
 name = "playhead"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A BitTorrent engine built for streaming: deadline piece picking around the playhead, seekable HTTP range server, and a fail-closed VPN interface binding."

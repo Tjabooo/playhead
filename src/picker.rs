@@ -38,6 +38,9 @@ pub struct PickerConfig {
     pub snub_secs: f64,
     pub max_dup_critical: usize,
     pub max_dup_window: usize,
+    /// Fetch the rest of the file in the background. Off = stream-only (assist) mode: only what
+    /// readers need next, for when another client downloads the file in order anyway.
+    pub background: bool,
 }
 
 impl Default for PickerConfig {
@@ -49,6 +52,7 @@ impl Default for PickerConfig {
             snub_secs: 6.0,
             max_dup_critical: 3,
             max_dup_window: 2,
+            background: true,
         }
     }
 }
@@ -130,6 +134,8 @@ pub struct Picker {
     inprog: HashMap<u32, InProgress>,
     readers: HashMap<u64, Reader>,
     prefetch: Vec<(u64, u64)>,
+    /// Pieces another client is downloading right now: left to it unless they're critical.
+    avoid: Bitfield,
     focus: (u64, u64),
     pub peers: HashMap<PeerKey, PeerState>,
     last_rate_update: Instant,
@@ -150,6 +156,7 @@ impl Picker {
             inprog: HashMap::new(),
             readers: HashMap::new(),
             prefetch: Vec::new(),
+            avoid: Bitfield::new(num_pieces),
             focus: (0, total_length),
             peers: HashMap::new(),
             last_rate_update: Instant::now(),
@@ -198,6 +205,34 @@ impl Picker {
     pub fn mark_have(&mut self, i: u32) {
         self.have.set(i);
         self.inprog.remove(&i);
+    }
+
+    /// Another source has piece `i` (assist mode): stop fetching it and return the cancels.
+    pub fn mark_have_elsewhere(&mut self, i: u32) -> Vec<Req> {
+        let mut cancels = Vec::new();
+        if self.have.get(i) {
+            return cancels;
+        }
+        for (key, p) in self.peers.iter_mut() {
+            let out: Vec<(u32, u32)> = p.outstanding.iter().copied().filter(|(pi, _)| *pi == i).collect();
+            for (pi, b) in out {
+                p.outstanding.remove(&(pi, b));
+                let size = (self.total_length - pi as u64 * self.piece_length).min(self.piece_length);
+                let len = (size - b as u64 * BLOCK as u64).min(BLOCK as u64) as u32;
+                cancels.push(Req { peer: *key, index: pi, begin: b * BLOCK, length: len });
+            }
+        }
+        self.mark_have(i);
+        cancels
+    }
+
+    /// The other source turned out not to have it after all: fetch it again.
+    pub fn unmark_have(&mut self, i: u32) {
+        self.have.clear(i);
+    }
+
+    pub fn set_avoid(&mut self, i: u32, avoid: bool) {
+        if avoid { self.avoid.set(i) } else { self.avoid.clear(i) }
     }
 
     // ---- peers ----
@@ -336,6 +371,9 @@ impl Picker {
             for i in first..=win_last {
                 let d = (i as u64 * self.piece_length).saturating_sub(r.pos);
                 let c = if i <= crit_last { Class::Critical } else { Class::Window };
+                if c == Class::Window && self.avoid.get(i) {
+                    continue;
+                }
                 add(i, c, d, &self.have, &self.wanted);
             }
         }
@@ -344,6 +382,9 @@ impl Picker {
                 continue;
             }
             for i in (s / self.piece_length) as u32..=((e - 1) / self.piece_length) as u32 {
+                if self.avoid.get(i) {
+                    continue;
+                }
                 add(i, Class::Window, u64::MAX / 2, &self.have, &self.wanted);
             }
         }
@@ -367,8 +408,9 @@ impl Picker {
         let first = (self.focus.0 / self.piece_length) as u32;
         let last = ((self.focus.1.max(1) - 1) / self.piece_length) as u32;
         let pivot = ((start / self.piece_length) as u32).clamp(first, last);
+        let background = self.cfg.background;
         let mut push = |i: u32| {
-            if self.wanted[i as usize] && !self.have.get(i) && !urgent.contains_key(&i) {
+            if background && self.wanted[i as usize] && !self.have.get(i) && !urgent.contains_key(&i) {
                 order.push((i, Class::Background));
             }
         };

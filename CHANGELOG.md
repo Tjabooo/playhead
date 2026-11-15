@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.0 (2026-11-15)
+
+- `playhead serve`: daemon mode, many streams behind a token-protected loopback JSON API.
+- Assist mode: run next to another client (qBittorrent) on the same torrent. Pieces it has are
+  served from its file (hash-checked, bad ones re-downloaded), pieces it's busy with are left to it,
+  and playhead fetches only what readers need next. No background download.
+- `playhead bench --client qbittorrent`: the same local swarm against a real qBittorrent, driven
+  like a media server's "play while downloading" (sequential + first/last piece priority, reads
+  held until pieceStates says verified). `--suite` runs five scenarios; `bench/qbittorrent-test.sh`
+  starts a throwaway headless qBittorrent.
+- HTTP readers stop when their engine stops instead of waiting for ever.
+
 ## v0.1.0 (2026-11-14)
 
 First release: a streaming BitTorrent engine.
