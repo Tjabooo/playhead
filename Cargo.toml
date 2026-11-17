@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-if-addrs = "0.13"
+if-addrs = "0.15"
 rand = "0.9"
 serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = "0.10"
