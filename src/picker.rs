@@ -41,6 +41,9 @@ pub struct PickerConfig {
     /// Fetch the rest of the file in the background. Off = stream-only (assist) mode: only what
     /// readers need next, for when another client downloads the file in order anyway.
     pub background: bool,
+    /// Assist mode: a piece the other client is downloading is left to it this long. After that it's
+    /// most likely stuck on one slow peer there, and fetching it here too is what gets it moving.
+    pub avoid_secs: f64,
 }
 
 impl Default for PickerConfig {
@@ -53,6 +56,7 @@ impl Default for PickerConfig {
             max_dup_critical: 3,
             max_dup_window: 2,
             background: true,
+            avoid_secs: 8.0,
         }
     }
 }
@@ -135,8 +139,10 @@ pub struct Picker {
     readers: HashMap<u64, Reader>,
     prefetch: Vec<(u64, u64)>,
     start_lead: Option<(u64, u64)>,
-    /// Pieces another client is downloading right now: left to it unless they're critical.
+    /// Pieces another client is downloading right now: left to it unless they're critical, or it has had
+    /// them for longer than `avoid_secs` (`avoid_since`: since when, for as long as it's on them).
     avoid: Bitfield,
+    avoid_since: HashMap<u32, Instant>,
     focus: (u64, u64),
     pub peers: HashMap<PeerKey, PeerState>,
     last_rate_update: Instant,
@@ -159,6 +165,7 @@ impl Picker {
             prefetch: Vec::new(),
             start_lead: None,
             avoid: Bitfield::new(num_pieces),
+            avoid_since: HashMap::new(),
             focus: (0, total_length),
             peers: HashMap::new(),
             last_rate_update: Instant::now(),
@@ -239,8 +246,25 @@ impl Picker {
         self.have.clear(i);
     }
 
-    pub fn set_avoid(&mut self, i: u32, avoid: bool) {
-        if avoid { self.avoid.set(i) } else { self.avoid.clear(i) }
+    /// The other client is (or isn't) downloading piece `i`. Called with its states every second or so.
+    pub fn set_avoid(&mut self, i: u32, avoid: bool, now: Instant) {
+        if !avoid {
+            self.avoid.clear(i);
+            self.avoid_since.remove(&i);
+        } else if let std::collections::hash_map::Entry::Vacant(e) = self.avoid_since.entry(i) {
+            e.insert(now);
+            self.avoid.set(i);
+        }
+    }
+
+    /// Pieces the other client has been on for too long are no longer left to it.
+    fn expire_avoid(&mut self, now: Instant) {
+        let patience = Duration::from_secs_f64(self.cfg.avoid_secs);
+        for (&i, &since) in &self.avoid_since {
+            if now.duration_since(since) >= patience && self.avoid.get(i) {
+                self.avoid.clear(i);
+            }
+        }
     }
 
     // ---- peers ----
@@ -385,14 +409,13 @@ impl Picker {
                 add(i, c, d, &self.have, &self.wanted);
             }
         }
+        // The file's head and tail, which a player reads before it starts: fetched here even while the other
+        // client is on them too (a few MB twice at worst, against a start held up by one slow peer).
         for &(s, e) in &self.prefetch {
             if e <= s {
                 continue;
             }
             for i in (s / self.piece_length) as u32..=((e - 1) / self.piece_length) as u32 {
-                if self.avoid.get(i) {
-                    continue;
-                }
                 add(i, Class::Window, u64::MAX / 2, &self.have, &self.wanted);
             }
         }
@@ -509,6 +532,7 @@ impl Picker {
     /// Requests to send now.
     pub fn pick(&mut self, now: Instant) -> Vec<Req> {
         self.update_rates(now);
+        self.expire_avoid(now);
         let mut reqs = Vec::new();
         if self.wanted_remaining() == 0 {
             return reqs;
@@ -858,6 +882,44 @@ mod tests {
         let reqs = p.pick(t0);
         assert_eq!(reqs.first().map(|r| r.index), Some(3), "{reqs:?}");
         assert!(reqs.iter().all(|r| r.index < 4), "nothing past the lead without background");
+    }
+
+    #[test]
+    fn a_piece_the_other_client_is_slow_with_is_fetched_here_too() {
+        let t0 = Instant::now();
+        let mut p = picker(PickerMode::Deadline);
+        p.cfg.background = false;
+        p.set_start_lead(Some((0, 4 * PL)));
+        seeder(&mut p, 1, t0);
+        for i in 0..4 {
+            p.set_avoid(i, true, t0);
+        }
+        assert!(p.pick(t0).is_empty(), "left to the other client at first");
+        // It reports the same pieces every second: that doesn't restart the clock.
+        for i in 0..4 {
+            p.set_avoid(i, true, t0 + Duration::from_secs(5));
+        }
+        assert!(p.pick(t0 + Duration::from_secs(5)).is_empty());
+        let reqs = p.pick(t0 + Duration::from_secs(9));
+        assert_eq!(reqs.first().map(|r| r.index), Some(3), "stuck there: fetched here, far end first");
+        // Once the other client lets go of a piece and picks it up again, it gets its full turn again.
+        p.set_avoid(2, false, t0 + Duration::from_secs(10));
+        p.set_avoid(2, true, t0 + Duration::from_secs(10));
+        p.piece_failed(2);
+        assert!(p.pick(t0 + Duration::from_secs(11)).iter().all(|r| r.index != 2));
+    }
+
+    #[test]
+    fn head_and_tail_are_fetched_even_while_the_other_client_is_on_them() {
+        let t0 = Instant::now();
+        let mut p = picker(PickerMode::Deadline);
+        p.cfg.background = false;
+        p.set_prefetch(vec![(0, PL), (31 * PL, 32 * PL)]);
+        seeder(&mut p, 1, t0);
+        p.set_avoid(0, true, t0);
+        p.set_avoid(31, true, t0);
+        let pieces: HashSet<u32> = p.pick(t0).iter().map(|r| r.index).collect();
+        assert_eq!(pieces, HashSet::from([0, 31]));
     }
 
     #[test]

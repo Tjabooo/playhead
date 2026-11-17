@@ -70,6 +70,7 @@ pub async fn run(cfg: DaemonConfig, guard: Arc<NetGuard>) -> std::io::Result<()>
         return Err(std::io::Error::other("the API token must be at least 16 characters"));
     }
     std::fs::create_dir_all(&cfg.cache_dir)?;
+    clear_leftovers(&cfg.cache_dir);
     let listener = TcpListener::bind(cfg.api).await?;
     log::info(&format!("API on http://{}", listener.local_addr()?));
     let streams: Registry = Arc::default();
@@ -105,6 +106,37 @@ pub async fn run(cfg: DaemonConfig, guard: Arc<NetGuard>) -> std::io::Result<()>
             let _ = sock.shutdown().await;
         });
     }
+}
+
+/// Streams never outlive the process, but one that was killed (or lost its parent) never cleaned up after
+/// itself: whatever is in the cache directory at start is left over. Renamed out of the way at once (so a new
+/// stream of the same torrent can't lose its fresh cache to the cleanup), deleted in the background.
+fn clear_leftovers(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut old = Vec::new();
+    for (n, entry) in entries.flatten().enumerate() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with("leftover-") {
+            old.push(path);
+            continue;
+        }
+        let to = dir.join(format!("leftover-{}-{n}", std::process::id()));
+        if std::fs::rename(&path, &to).is_ok() {
+            old.push(to);
+        }
+    }
+    if old.is_empty() {
+        return;
+    }
+    log::info(&format!("removing {} stream cache(s) left over from before", old.len()));
+    tokio::task::spawn_blocking(move || {
+        for p in old {
+            let gone = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+            if let Err(e) = gone {
+                log::warn(&format!("couldn't delete {}: {e}", p.display()));
+            }
+        }
+    });
 }
 
 fn authorized(cfg: &DaemonConfig, req: &Request) -> bool {

@@ -1,5 +1,11 @@
-//! Disk storage: verified pieces are written into the selected files (sparse, preallocated).
-//! Bytes that belong to unselected or blocked files are dropped, so a blocked `.exe` is never created.
+//! Disk storage: verified pieces are written into the selected files, which are sparse: a file only
+//! takes the space of the pieces written into it. Bytes that belong to unselected or blocked files are
+//! dropped, so a blocked `.exe` is never created.
+//!
+//! Sparse matters on Windows: NTFS allocates a normal file's full length up front and, on a write far
+//! past what was written before, fills everything in between with zeros first. Next to another client
+//! that already has most of a 20 GB file, that meant 20 GB of zeros (minutes of disk time, and a full
+//! disk) for a piece at the end.
 
 use crate::metainfo::Metainfo;
 use sha1::{Digest, Sha1};
@@ -13,6 +19,47 @@ pub struct Storage {
     meta: Arc<Metainfo>,
     selected: Vec<bool>,
     files: Vec<Option<File>>,
+}
+
+/// Mark a file sparse, so its length costs no disk space until data is written (Unix files already are).
+#[cfg(windows)]
+pub fn set_sparse(f: &File) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            device: *mut c_void,
+            code: u32,
+            input: *const c_void,
+            input_len: u32,
+            output: *mut c_void,
+            output_len: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+    }
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    let mut returned = 0u32;
+    // SAFETY: a valid handle owned by `f`; no buffers (FSCTL_SET_SPARSE with no input sets the flag).
+    let ok = unsafe {
+        DeviceIoControl(
+            f.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+#[cfg(not(windows))]
+pub fn set_sparse(_f: &File) -> io::Result<()> {
+    Ok(())
 }
 
 /// One piece's overlap with one file: (file index, offset in file, offset in piece, length).
@@ -55,6 +102,9 @@ impl Storage {
             let f = OpenOptions::new().read(true).write(true).create(create).truncate(false).open(&path)?;
             let want = self.meta.files[fi].length;
             if f.metadata()?.len() != want {
+                if let Err(e) = set_sparse(&f) {
+                    crate::log::debug(&format!("{}: not a sparse file ({e})", path.display()));
+                }
                 f.set_len(want)?;
             }
             self.files[fi] = Some(f);

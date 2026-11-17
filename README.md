@@ -102,7 +102,8 @@ the torrent in order, like qBittorrent, without taking it over:
   2 verified) and where it keeps the file.
 - Pieces the other client has are read from its file. Each one is hash-checked once, and a bad
   one is downloaded after all.
-- Pieces it's busy with are left to it unless a reader needs them right now.
+- Pieces it's busy with are left to it unless a reader needs them right now, or it has been on one for 8 s
+  (probably stuck on a slow peer there). The file's head and tail are always fetched: players read both first.
 - playhead downloads only what a reader needs next that the other client doesn't have yet: the
   start, a seek target, a piece stuck on a slow peer.
 - Nothing is downloaded in the background, and the other client stays the one that finishes,

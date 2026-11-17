@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.5 (2026-11-17)
+
+- Files are sparse on Windows too. NTFS used to reserve a file's full length and, for a piece written
+  far into it, fill everything before it with zeros first: next to a client that already had most of
+  a 20 GB film, one piece near the end meant minutes of writing zeros and a full disk.
+- Hash checks and disk writes (and reads for uploads) run off the engine's control loop, so a slow or
+  full disk no longer freezes the API, the readers and every peer of that stream.
+- Only pieces playhead has in its own files are offered to and uploaded to peers. In assist mode the
+  other client's pieces used to be advertised too, and a request for one was answered from a hole in
+  playhead's file (zeros), which peers count as bad data from that address.
+- Assist mode: a piece the other client has been downloading for 8 s is fetched here too (it's most
+  likely stuck on one slow peer there), and the file's head and tail are always fetched, even while
+  the other client is on them: a player reads both before it starts.
+- `playhead serve` removes stream caches left behind by a process that was killed.
+
 ## v0.2.4 (2026-11-17)
 
 - Up to 40 outgoing connections are set up at once (was 12), each given 4 s (was 8): most tracker and

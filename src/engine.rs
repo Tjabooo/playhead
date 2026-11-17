@@ -82,7 +82,15 @@ enum Ctrl {
     Incoming { stream: tokio::net::TcpStream, addr: SocketAddr, hs: wire::Handshake },
     External { states: Vec<u8> },
     ExternalBad { index: u32 },
+    PieceChecked { index: u32, contributors: Vec<PeerKey>, result: Checked },
     Shutdown { reply: oneshot::Sender<()> },
+}
+
+/// What became of a completed piece (`Ctrl::PieceChecked`): its hash check and disk write run off the actor.
+enum Checked {
+    Written,
+    BadHash,
+    DiskError(String),
 }
 
 struct Shared {
@@ -180,6 +188,7 @@ impl Engine {
             pending_external: None,
             external_bad: Default::default(),
             limiter: None,
+            last_disk_error: None,
         };
         actor.limiter = actor.cfg.download_limit.map(|l| Arc::new(peer::RateLimiter::new(l)));
         for p in peers {
@@ -381,7 +390,9 @@ struct Actor {
     meta_tx: watch::Sender<Option<Arc<Metainfo>>>,
     md: MetadataFetch,
     picker: Option<Picker>,
-    storage: Option<Storage>,
+    /// Shared with the blocking threads that hash, write and read pieces: the actor itself never touches
+    /// the disk, so a slow or full disk can't freeze peers, readers or the API.
+    storage: Option<Arc<Mutex<Storage>>>,
     selected: Vec<usize>,
     shared: Arc<Shared>,
     have_tx: watch::Sender<u64>,
@@ -407,6 +418,7 @@ struct Actor {
     pending_external: Option<Vec<u8>>,
     external_bad: std::collections::HashSet<u32>,
     limiter: Option<Arc<peer::RateLimiter>>,
+    last_disk_error: Option<Instant>,
 }
 
 const METADATA_PIECE: u64 = 16 * 1024;
@@ -456,8 +468,8 @@ impl Actor {
         if let Some(l) = self.listener.take() {
             l.abort();
         }
-        if let Some(s) = &mut self.storage {
-            s.flush();
+        if let Some(s) = &self.storage {
+            s.lock().unwrap().flush();
         }
     }
 
@@ -667,8 +679,12 @@ impl Actor {
                 log::debug(&format!("peer {addr} connected{}", if incoming { " (incoming)" } else { "" }));
                 if let Some(pk) = &mut self.picker {
                     pk.add_peer(key, now);
-                    if pk.have.count() > 0 {
-                        let bf = pk.have.as_bytes().to_vec();
+                    // Only pieces in our own files: the picker's "have" also holds pieces the other client has
+                    // (assist mode) and pieces still being written, which we can't upload.
+                    let own = self.shared.have.lock().unwrap();
+                    if own.count() > 0 {
+                        let bf = own.as_bytes().to_vec();
+                        drop(own);
                         self.send(key, Message::Bitfield(bf));
                     }
                 }
@@ -807,26 +823,51 @@ impl Actor {
             self.send(c.peer, Message::Cancel { index: c.index, begin: c.begin, length: c.length });
         }
         let Some(done) = out.completed else { return };
-        let meta = self.meta.clone().unwrap();
-        let ok = Sha1::digest(&done.data).as_slice() == meta.pieces[done.index as usize];
-        if !ok {
-            self.hash_fails += 1;
-            let pk = self.picker.as_mut().unwrap();
-            pk.piece_failed(done.index);
-            log::warn(&format!("piece {} failed its hash check ({} peers sent parts)", done.index, done.contributors.len()));
-            if done.contributors.len() == 1 {
-                self.drop_peer(done.contributors[0], true);
+        // Counted as had right away so nobody fetches it again meanwhile; readers and peers see it only once
+        // it's checked and on disk (PieceChecked).
+        if let Some(pk) = &mut self.picker {
+            pk.mark_have(done.index);
+        }
+        let (Some(meta), Some(storage)) = (self.meta.clone(), self.storage.clone()) else { return };
+        let ctrl = self.ctrl_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let index = done.index;
+            let result = if Sha1::digest(&done.data).as_slice() != meta.pieces[index as usize] {
+                Checked::BadHash
+            } else {
+                match storage.lock().unwrap().write_piece(index, &done.data) {
+                    Ok(_) => Checked::Written,
+                    Err(e) => Checked::DiskError(e.to_string()),
+                }
+            };
+            let _ = ctrl.send(Ctrl::PieceChecked { index, contributors: done.contributors, result });
+        });
+    }
+
+    fn on_piece_checked(&mut self, index: u32, contributors: Vec<PeerKey>, result: Checked) {
+        let Some(pk) = &mut self.picker else { return };
+        match result {
+            Checked::Written => self.piece_done(index),
+            Checked::BadHash => {
+                self.hash_fails += 1;
+                pk.unmark_have(index);
+                pk.piece_failed(index);
+                log::warn(&format!("piece {index} failed its hash check ({} peers sent parts)", contributors.len()));
+                if contributors.len() == 1 {
+                    self.drop_peer(contributors[0], true);
+                }
             }
-            return;
+            Checked::DiskError(e) => {
+                pk.unmark_have(index);
+                pk.piece_failed(index);
+                // (A full disk fails every piece: once in a while is enough to say so.)
+                if self.last_disk_error.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+                    self.last_disk_error = Some(Instant::now());
+                    log::error(&format!("disk write failed for piece {index}: {e}"));
+                }
+            }
         }
-        if let Some(st) = &mut self.storage
-            && let Err(e) = st.write_piece(done.index, &done.data)
-        {
-            log::error(&format!("disk write failed for piece {}: {e}", done.index));
-            self.picker.as_mut().unwrap().piece_failed(done.index);
-            return;
-        }
-        self.piece_done(done.index);
+        self.request_blocks();
     }
 
     fn piece_done(&mut self, index: u32) {
@@ -846,8 +887,8 @@ impl Actor {
         if self.completed_at.is_none() && self.picker.as_ref().is_some_and(|p| p.wanted_remaining() == 0) && !self.selected.is_empty() {
             self.completed_at = Some(Instant::now());
             log::info(&format!("selected file(s) complete in {:.1} s", self.started.elapsed().as_secs_f64()));
-            if let Some(s) = &mut self.storage {
-                s.flush();
+            if let Some(s) = self.storage.clone() {
+                tokio::task::spawn_blocking(move || s.lock().unwrap().flush());
             }
             for t in &mut self.trackers {
                 t.next = Instant::now();
@@ -864,19 +905,23 @@ impl Actor {
             return;
         }
         let Some(pk) = &self.picker else { return };
-        if !pk.have.get(index) || begin as u64 + length as u64 > pk.piece_size(index) {
+        // Only what's in our own files (never a piece the other client has: our file has a hole there).
+        if !self.shared.have.lock().unwrap().get(index) || begin as u64 + length as u64 > pk.piece_size(index) {
             return;
         }
-        let Some(st) = &mut self.storage else { return };
-        // Pieces are small enough that re-reading them per request is fine for phase 1.
-        if let Ok(Some(piece)) = st.read_piece(index) {
-            let data = piece[begin as usize..(begin + length) as usize].to_vec();
-            self.uploaded += length as u64;
-            if let Some(p) = self.peers.get_mut(&key) {
-                p.uploaded += length as u64;
-            }
-            self.send(key, Message::Piece { index, begin, data });
+        let Some(st) = self.storage.clone() else { return };
+        let cmd = p.cmd.clone();
+        self.uploaded += length as u64;
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.uploaded += length as u64;
         }
+        tokio::task::spawn_blocking(move || {
+            // Pieces are small enough that re-reading them per request is fine.
+            if let Ok(Some(piece)) = st.lock().unwrap().read_piece(index) {
+                let data = piece[begin as usize..(begin + length) as usize].to_vec();
+                let _ = cmd.send(PeerCmd::Send(Message::Piece { index, begin, data }));
+            }
+        });
     }
 
     fn on_metadata_piece(&mut self, key: PeerKey, piece: u32, data: Vec<u8>) {
@@ -915,7 +960,7 @@ impl Actor {
         pk.set_wanted_range(1, 0, (0, meta.total_length)); // nothing until a file is selected
         *self.shared.have.lock().unwrap() = Bitfield::new(meta.num_pieces());
         *self.shared.external.lock().unwrap() = Bitfield::new(meta.num_pieces());
-        self.storage = Some(Storage::new(self.cfg.out_dir.clone(), meta.clone()));
+        self.storage = Some(Arc::new(Mutex::new(Storage::new(self.cfg.out_dir.clone(), meta.clone()))));
         let now = Instant::now();
         let keys: Vec<PeerKey> = self.peers.iter().filter(|(_, p)| p.ready).map(|(k, _)| *k).collect();
         for k in &keys {
@@ -1031,6 +1076,7 @@ impl Actor {
                     self.completed_at = None;
                 }
             }
+            Ctrl::PieceChecked { index, contributors, result } => self.on_piece_checked(index, contributors, result),
             Ctrl::Shutdown { .. } => unreachable!(),
         }
     }
@@ -1043,6 +1089,7 @@ impl Actor {
         let n = pk.num_pieces() as usize;
         let mut cancels = Vec::new();
         let mut newly = 0;
+        let now = Instant::now();
         {
             let own = self.shared.have.lock().unwrap();
             let mut ext = self.shared.external.lock().unwrap();
@@ -1053,7 +1100,7 @@ impl Actor {
                     cancels.extend(pk.mark_have_elsewhere(i));
                     newly += 1;
                 }
-                pk.set_avoid(i, s == 1);
+                pk.set_avoid(i, s == 1, now);
             }
         }
         for c in cancels {
@@ -1076,8 +1123,8 @@ impl Actor {
             return Ok(());
         }
         self.selected.push(file);
-        let st = self.storage.as_mut().unwrap();
-        st.select(file);
+        let storage = self.storage.clone().unwrap();
+        storage.lock().unwrap().select(file);
         let pk = self.picker.as_mut().unwrap();
         // Union of selected files' pieces.
         let (mut lo, mut hi) = (first, last);
@@ -1098,7 +1145,8 @@ impl Actor {
         if self.cfg.resume {
             let path = meta.file_path(&self.cfg.out_dir, file);
             if path.exists() {
-                let good = st.verify_existing(first..=last);
+                // (Resume is the command line's: `serve` streams always start empty, so this never holds up the daemon.)
+                let good = storage.lock().unwrap().verify_existing(first..=last);
                 if !good.is_empty() {
                     log::info(&format!("resume: {} of {} pieces already on disk", good.len(), last - first + 1));
                 }

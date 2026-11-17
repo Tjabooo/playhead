@@ -166,8 +166,27 @@ async fn assist_mode_fetches_only_what_is_read() {
     assert_eq!(&buf[end + 4..], &data[8_000_000..9_000_000]);
     tokio::time::sleep(Duration::from_secs(2)).await;
     let sent = seeder.stats.bytes_sent.load(Ordering::Relaxed);
-    // 1 MB read + 4 MB window + 2 MB head/tail prefetch + piece slack, far below the 16 MB file.
-    assert!(sent < 9_000_000, "assist mode downloaded {sent} bytes");
+    // 1 MB read + 4 MB window + 2 MB head + 2 MB tail prefetch + requests already on the wire when the reader
+    // left (a fast local seeder fills a deep pipeline), far below the 16 MB file.
+    assert!(sent < 10_500_000, "assist mode downloaded {sent} bytes");
+}
+
+/// A daemon that was killed leaves its streams' caches behind: the next one starts by removing them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leftover_caches_are_removed_at_start() {
+    let cache = tempfile::tempdir().unwrap();
+    let old = cache.path().join("0b4515c945e366d2c6f89222dd338873edfa2548");
+    std::fs::create_dir_all(old.join("Film")).unwrap();
+    std::fs::write(old.join("Film/film.mkv"), vec![0u8; 100_000]).unwrap();
+    let api = daemon(cache.path()).await;
+    for _ in 0..50 {
+        if std::fs::read_dir(cache.path()).unwrap().next().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none(), "leftovers still there");
+    assert_eq!(call(api, "GET", "/api/health", Some(TOKEN), None).await.0, 200);
 }
 
 #[test]
