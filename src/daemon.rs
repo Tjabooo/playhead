@@ -116,8 +116,14 @@ fn clear_leftovers(dir: &std::path::Path) {
     let mut old = Vec::new();
     for (n, entry) in entries.flatten().enumerate() {
         let path = entry.path();
-        if entry.file_name().to_string_lossy().starts_with("leftover-") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("leftover-") {
             old.push(path);
+            continue;
+        }
+        // Only stream caches (named by their 40-hex info hash): never anything else that
+        // happens to live in a cache dir someone pointed us at.
+        if name.len() != 40 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
         let to = dir.join(format!("leftover-{}-{n}", std::process::id()));
