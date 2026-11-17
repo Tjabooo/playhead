@@ -351,6 +351,11 @@ struct PeerConn {
     md_rejects: u32,
 }
 
+/// Outgoing connections being set up at once, and how long one may take. A peer that answers does so within
+/// a second or two even through a VPN; waiting longer only holds a slot that a reachable peer could use.
+const MAX_CONNECTING: usize = 40;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
 struct KnownPeer {
     fails: u32,
     next_try: Instant,
@@ -551,8 +556,10 @@ impl Actor {
         if active >= self.cfg.max_peers {
             return;
         }
+        // Most addresses trackers and DHT hand out don't answer (NAT, gone): try many at once so the reachable
+        // ones are found in seconds, not minutes (12 at a time found 2 of ~1000 in a minute through a VPN).
         let connecting = self.peers.values().filter(|p| !p.ready).count();
-        let budget = (self.cfg.max_peers - active).min(12usize.saturating_sub(connecting));
+        let budget = (self.cfg.max_peers - active).min(MAX_CONNECTING.saturating_sub(connecting));
         let now = Instant::now();
         let mut cands: Vec<(SocketAddr, u32)> =
             self.known.iter().filter(|(_, k)| !k.connected && !k.banned && k.next_try <= now).map(|(a, k)| (*a, k.fails)).collect();
@@ -601,7 +608,7 @@ impl Actor {
         tokio::spawn(async move {
             match incoming {
                 Some((stream, hs)) => peer::run(setup, stream, addr, Some(hs), rx).await,
-                None => match guard.tcp_connect(addr, Duration::from_secs(8)).await {
+                None => match guard.tcp_connect(addr, CONNECT_TIMEOUT).await {
                     Ok(stream) => peer::run(setup, stream, addr, None, rx).await,
                     Err(e) => {
                         let _ = setup.events.send(PeerEvent::Closed { key, reason: format!("connect: {e}") }).await;

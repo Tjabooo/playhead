@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.4 (2026-11-17)
+
+- Up to 40 outgoing connections are set up at once (was 12), each given 4 s (was 8): most tracker and
+  DHT addresses never answer, and through a VPN the old pace found 2 of ~1000 peers in a minute.
+
 ## v0.2.3 (2026-11-15)
 
 - Peer exchange (BEP 11, receiving): peers tell playhead about other peers.
